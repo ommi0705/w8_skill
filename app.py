@@ -4,6 +4,12 @@ from typing import List, Optional
 from datetime import datetime
 from fastapi import FastAPI, Request, Form, UploadFile, File, BackgroundTasks, HTTPException, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
+if os.getenv("GEMINI_API_KEY") and os.getenv("GEMINI_API_KEY") != "your_generic_api_key_here":
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -91,7 +97,7 @@ def get_current_user(db: Session = Depends(get_db)):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html")
 
 @app.get("/api/sessions")
 def get_sessions(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -146,26 +152,63 @@ async def chat(request: Request, chat_req: ChatRequest, db: Session = Depends(ge
     stop_events[chat_req.session_id] = stop_event
 
     async def event_generator():
-        # -- 核心邏輯模擬 --
-        # 如果是真實串接，這邊將會呼叫 OpenAI 或 Gemini API 的 .stream()
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key or api_key == "your_generic_api_key_here":
+            msg = f"[提示] 目前尚未填寫您的 GEMINI_API_KEY 於 `.env` 中，所以系統仍為模擬模式喔！請至本機的 .env 檔案更換 API 金鑰即可啟動真正的 AI！\n\n您說了：{chat_req.content}"
+            db_conn = SessionLocal()
+            final_msg = db_conn.query(Message).filter(Message.id == ai_msg.id).first()
+            if final_msg:
+                final_msg.content = msg
+                db_conn.commit()
+            db_conn.close()
+            for char in msg:
+                if stop_event.is_set(): break
+                yield f"data: {'<br>' if char == '\\n' else char}\n\n"
+                await asyncio.sleep(0.02)
+            yield "data: [DONE]\n\n"
+            return
+
+        db_conn = SessionLocal()
+        history_msgs = db_conn.query(Message).filter(Message.session_id == chat_req.session_id).order_by(Message.created_at.asc()).all()
+        # 準備給模型的對話格式
+        gemini_history = []
+        for m in history_msgs[:-2]: # 去除剛新增的一對空白
+            role = "user" if m.role == "user" else "model"
+            if m.content and m.content.strip():
+                gemini_history.append({"role": role, "parts": [m.content]})
+        db_conn.close()
+
+        # 執行 LLM
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        chat_session = model.start_chat()
+        if gemini_history:
+            try:
+                chat_session = model.start_chat(history=gemini_history)
+            except:
+                chat_session = model.start_chat()
         
-        reply_base = f"我已收到您的訊息：「{chat_req.content}」。在這模擬模式中，我正在逐字產生回應... 這裡已經串接好工具使用架構與檔案處理。"
+        prompt = chat_req.content
         if chat_req.media_path:
-            reply_base += f"\n\n[系統通知] 發現您夾帶的文件/圖片：「{chat_req.media_path}」，我已能存取。"
-            
+            prompt += f"\n[使用者有附加上傳檔案，路徑為: {chat_req.media_path}]"
+
         full_response = ""
-        # 逐字輸出模擬
-        for char in reply_base:
-            if stop_event.is_set():
-                full_response += " [(系統) 生成已由使用者中止]"
-                yield f"data:  [(系統) 生成已由使用者中止]\n\n"
-                break
+        try:
+            response = chat_session.send_message(prompt, stream=True)
+            for chunk in response:
+                if stop_event.is_set():
+                    full_response += " [(系統) 生成已由使用者中止]"
+                    yield f"data: [(系統) 生成已由使用者中止]\n\n"
+                    break
+                if chunk.text:
+                    full_response += chunk.text
+                    chunk_text = chunk.text.replace("\n", "<br>")
+                    yield f"data: {chunk_text}\n\n"
+                    await asyncio.sleep(0.01)
+        except Exception as e:
+            full_response = f"API 發生錯誤：{str(e)}"
+            yield f"data: {full_response}\n\n"
             
-            full_response += char
-            yield f"data: {char}\n\n"
-            await asyncio.sleep(0.04) # 模擬打字延遲
-            
-        # 生成完畢後，把完整句子寫回資料庫
+        # 儲存
         db_conn = SessionLocal()
         final_msg = db_conn.query(Message).filter(Message.id == ai_msg.id).first()
         if final_msg:
